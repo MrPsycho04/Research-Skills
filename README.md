@@ -1,0 +1,2 @@
+# Bughunter
+Bug hunter skills
